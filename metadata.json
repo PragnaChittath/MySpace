@@ -1,0 +1,11 @@
+{
+  "name": "MySpace",
+  "description": "Secure digital document vault with AES-256-GCM encryption, facial biometric authentication, direct temporary link sharing, time-limited QR codes, and granular access revocation.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
