@@ -230,10 +230,13 @@ export function AuthMfaModal({
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-300 mb-1">Master Vault Password</label>
+              <label className="block text-xs font-bold text-slate-300 mb-1">
+                {mode === 'REGISTER' ? 'Create Master Vault Password (min 6 characters)' : 'Master Vault Password'}
+              </label>
               <input
                 type="password"
                 required
+                minLength={6}
                 placeholder="••••••••••••"
                 value={password}
                 onChange={e => setPassword(e.target.value)}

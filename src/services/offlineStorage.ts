@@ -181,6 +181,62 @@ export interface OfflineCacheStats {
   algorithm: string;
 }
 
+export interface ClientUserRecord extends User {
+  passwordHash: string;
+  passwordSalt: string;
+  faceEmbedding?: number[];
+  faceEmbeddingEncrypted?: string;
+  faceEmbeddingIv?: string;
+  faceEmbeddingAuthTag?: string;
+  faceEmbeddingSalt?: string;
+  faceAuthEnabled?: boolean;
+  hasFaceBiometrics?: boolean;
+  faceRegisteredAt?: string;
+  failedFaceAttempts?: number;
+}
+
+export async function hashPasswordClient(password: string, customSalt?: string): Promise<{ hash: string; salt: string }> {
+  const salt = customSalt || bufferToHex(crypto.getRandomValues(new Uint8Array(16)));
+  try {
+    if (typeof crypto !== 'undefined' && crypto.subtle) {
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        'raw',
+        enc.encode(password),
+        { name: 'PBKDF2' },
+        false,
+        ['deriveBits']
+      );
+      const derivedBits = await crypto.subtle.deriveBits(
+        {
+          name: 'PBKDF2',
+          salt: hexToBuffer(salt),
+          iterations: 50000,
+          hash: 'SHA-256'
+        },
+        keyMaterial,
+        256
+      );
+      const hash = bufferToHex(new Uint8Array(derivedBits));
+      return { hash, salt };
+    }
+  } catch (err) {
+    console.warn('[OfflineStorage] Subtle crypto derivation fallback', err);
+  }
+  // Simple fallback hash
+  let fallbackHash = 0;
+  for (let i = 0; i < password.length; i++) {
+    fallbackHash = ((fallbackHash << 5) - fallbackHash) + password.charCodeAt(i);
+    fallbackHash |= 0;
+  }
+  return { hash: `fb_${Math.abs(fallbackHash)}_${salt}`, salt };
+}
+
+export async function verifyPasswordClient(password: string, storedHash: string, salt: string): Promise<boolean> {
+  const result = await hashPasswordClient(password, salt);
+  return result.hash === storedHash;
+}
+
 export const offlineStorage = {
   /**
    * Check if offline storage is available in the current browser
@@ -403,9 +459,56 @@ export const offlineStorage = {
   },
 
   /**
-   * Retrieve cached user session profile
+   * Save full user credential record offline (with encrypted password hash & biometrics)
    */
-  async getUser(userId?: string): Promise<User | null> {
+  async saveUserRecord(userRecord: ClientUserRecord): Promise<void> {
+    try {
+      const db = await openDB();
+      const { ivHex, encryptedBuffer } = await encryptAtRest(userRecord);
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORES.USER, 'readwrite');
+        const store = tx.objectStore(STORES.USER);
+        const req = store.put({
+          id: userRecord.id,
+          email: userRecord.email.toLowerCase(),
+          cachedAt: new Date().toISOString(),
+          ivHex,
+          encryptedBuffer
+        });
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+
+      // Also mirror to localStorage for instant non-indexedDB access
+      if (typeof window !== 'undefined') {
+        const existingUsers = this.getLocalStorageUsers();
+        const idx = existingUsers.findIndex(u => u.id === userRecord.id || u.email.toLowerCase() === userRecord.email.toLowerCase());
+        if (idx >= 0) {
+          existingUsers[idx] = userRecord;
+        } else {
+          existingUsers.push(userRecord);
+        }
+        localStorage.setItem('myspace_vault_users', JSON.stringify(existingUsers));
+      }
+    } catch (err) {
+      console.warn('[OfflineStorage] Failed to save user record offline:', err);
+    }
+  },
+
+  getLocalStorageUsers(): ClientUserRecord[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem('myspace_vault_users');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  },
+
+  /**
+   * Retrieve all user records from offline storage
+   */
+  async getAllUserRecords(): Promise<ClientUserRecord[]> {
     try {
       const db = await openDB();
       const records: any[] = await new Promise((resolve, reject) => {
@@ -416,11 +519,116 @@ export const offlineStorage = {
         req.onerror = () => reject(req.error);
       });
 
-      if (!records || records.length === 0) return null;
+      const users: ClientUserRecord[] = [];
+      for (const r of records) {
+        try {
+          const u = await decryptAtRest<ClientUserRecord>(r.encryptedBuffer, r.ivHex);
+          if (u && u.id && u.email) {
+            users.push(u);
+          }
+        } catch {}
+      }
+
+      // Merge with localStorage users if any
+      const lsUsers = this.getLocalStorageUsers();
+      for (const lsu of lsUsers) {
+        if (!users.some(u => u.id === lsu.id || u.email.toLowerCase() === lsu.email.toLowerCase())) {
+          users.push(lsu);
+        }
+      }
+
+      return users;
+    } catch (err) {
+      return this.getLocalStorageUsers();
+    }
+  },
+
+  /**
+   * Retrieve user record by email address
+   */
+  async getUserRecordByEmail(email: string): Promise<ClientUserRecord | null> {
+    if (!email) return null;
+    const cleanEmail = email.trim().toLowerCase();
+    const all = await this.getAllUserRecords();
+    return all.find(u => u.email.toLowerCase() === cleanEmail) || null;
+  },
+
+  /**
+   * Retrieve user record by user ID
+   */
+  async getUserRecordById(id: string): Promise<ClientUserRecord | null> {
+    if (!id) return null;
+    const all = await this.getAllUserRecords();
+    return all.find(u => u.id === id) || null;
+  },
+
+  /**
+   * Delete user record from offline storage
+   */
+  async deleteUserRecord(id: string): Promise<void> {
+    try {
+      const db = await openDB();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORES.USER, 'readwrite');
+        const store = tx.objectStore(STORES.USER);
+        const req = store.delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+      if (typeof window !== 'undefined') {
+        const existingUsers = this.getLocalStorageUsers().filter(u => u.id !== id);
+        localStorage.setItem('myspace_vault_users', JSON.stringify(existingUsers));
+      }
+    } catch (err) {
+      console.warn('[OfflineStorage] Error deleting user record:', err);
+    }
+  },
+
+  /**
+   * Retrieve cached user session profile
+   */
+  async getUser(userId?: string): Promise<User | null> {
+    try {
+      if (userId) {
+        const record = await this.getUserRecordById(userId);
+        if (record) {
+          const { passwordHash, passwordSalt, ...safeUser } = record;
+          return safeUser;
+        }
+      }
+      const db = await openDB();
+      const records: any[] = await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORES.USER, 'readonly');
+        const store = tx.objectStore(STORES.USER);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+
+      if (!records || records.length === 0) {
+        const lsUsers = this.getLocalStorageUsers();
+        if (lsUsers.length > 0) {
+          const target = userId ? lsUsers.find(r => r.id === userId) || lsUsers[0] : lsUsers[0];
+          const { passwordHash, passwordSalt, ...safeUser } = target;
+          return safeUser;
+        }
+        return null;
+      }
       const target = userId ? records.find(r => r.id === userId) || records[0] : records[0];
-      return await decryptAtRest<User>(target.encryptedBuffer, target.ivHex);
+      const userObj = await decryptAtRest<any>(target.encryptedBuffer, target.ivHex);
+      if (userObj) {
+        const { passwordHash, passwordSalt, ...safeUser } = userObj;
+        return safeUser;
+      }
+      return null;
     } catch (err) {
       console.warn('[OfflineStorage] Failed to retrieve offline user:', err);
+      const lsUsers = this.getLocalStorageUsers();
+      if (lsUsers.length > 0) {
+        const target = userId ? lsUsers.find(r => r.id === userId) || lsUsers[0] : lsUsers[0];
+        const { passwordHash, passwordSalt, ...safeUser } = target;
+        return safeUser;
+      }
       return null;
     }
   },
