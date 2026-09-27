@@ -38,6 +38,7 @@ import { DocumentCategory, SensitivityLevel, User, VaultDocument } from '../type
 import { formatBytes, formatAudioDuration } from '../utils/formatters.js';
 import { AudioWaveformVisualizer } from './AudioWaveformVisualizer.js';
 import { useTranslation } from '../i18n/LanguageContext.js';
+import { api } from '../services/api.js';
 
 interface UploadNewModalProps {
   currentUser: User | null;
@@ -164,7 +165,50 @@ export function UploadNewModal({
   // --------------------------------------------------------------------------
   const [stagedFiles, setStagedFiles] = useState<StagedFile[]>([]);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [isSmartAnalyzing, setIsSmartAnalyzing] = useState<boolean>(false);
+  const [smartNotice, setSmartNotice] = useState<string | null>(null);
   const deviceFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleSmartDetectStaged = async () => {
+    if (stagedFiles.length === 0) return;
+    setIsSmartAnalyzing(true);
+    setSmartNotice(null);
+    let quotaHit = false;
+
+    const updated = [...stagedFiles];
+    for (let i = 0; i < updated.length; i++) {
+      try {
+        const res = await api.analyzeDocumentMetadata({
+          title: updated[i].title,
+          fileName: updated[i].name,
+          fileType: updated[i].type
+        });
+        if (res.category && res.category !== 'OTHER') {
+          updated[i].category = res.category;
+        }
+        if (res.suggestedTags && res.suggestedTags.length > 0) {
+          updated[i].tags = Array.from(new Set([...updated[i].tags, ...res.suggestedTags]));
+        }
+        if (res.documentNumber && !updated[i].documentNumber) {
+          updated[i].documentNumber = res.documentNumber;
+        }
+        if (res.quotaExhausted) {
+          quotaHit = true;
+        }
+      } catch {
+        // safe fallback
+      }
+    }
+
+    setStagedFiles(updated);
+    setIsSmartAnalyzing(false);
+
+    if (quotaHit) {
+      setSmartNotice('AI Studio quota limit reached. Local deterministic analysis applied seamlessly to all staged files.');
+    } else {
+      setSmartNotice('Smart metadata suggestions applied to staged files.');
+    }
+  };
 
   const processSelectedFiles = async (files: FileList | File[]) => {
     setErrorMsg('');
@@ -279,17 +323,7 @@ export function UploadNewModal({
           audioDurationSeconds: item.audioDurationSeconds
         };
 
-        const res = await fetch('/api/documents', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        if (!res.ok) {
-          throw new Error(`Failed to upload ${item.name}`);
-        }
-
-        const created = await res.json();
+        const created = await api.uploadDocument(payload);
         uploadedDocs.push(created);
       }
 
@@ -521,14 +555,7 @@ export function UploadNewModal({
         verifiedIssuer: 'Camera Media Capture'
       };
 
-      const res = await fetch('/api/documents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) throw new Error('Failed to encrypt and save media.');
-      const created = await res.json();
+      const created = await api.uploadDocument(payload);
       onUploadSuccess(created);
       onClose();
     } catch (err: any) {
@@ -667,7 +694,7 @@ export function UploadNewModal({
           userId: currentUser?.id || 'usr_default',
           ownerName: currentUser?.name || 'Vault User',
           title: safeTitle,
-          category: 'VOICE_AUDIO',
+          category: 'VOICE_AUDIO' as DocumentCategory,
           documentNumber: '',
           fileName: `${safeTitle.replace(/[^a-zA-Z0-9_-]/g, '_')}.webm`,
           fileType: recordedVoiceBlob.type || 'audio/webm',
@@ -680,14 +707,7 @@ export function UploadNewModal({
           audioDurationSeconds: voiceAudioDuration || voiceRecordingSeconds
         };
 
-        const res = await fetch('/api/documents', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        if (!res.ok) throw new Error('Failed to encrypt and save voice note.');
-        const created = await res.json();
+        const created = await api.uploadDocument(payload);
         onUploadSuccess(created);
         onClose();
       };
@@ -873,14 +893,7 @@ export function UploadNewModal({
         verifiedIssuer: 'Pasted Clipboard Record'
       };
 
-      const res = await fetch('/api/documents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) throw new Error('Failed to encrypt and save pasted content.');
-      const created = await res.json();
+      const created = await api.uploadDocument(payload);
       onUploadSuccess(created);
       onClose();
     } catch (err: any) {
@@ -1250,15 +1263,43 @@ export function UploadNewModal({
                       <FolderUp className="w-4 h-4 text-blue-400" />
                       {stagedFiles.length} file(s) staged for encryption
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => deviceFileInputRef.current?.click()}
-                      className="text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1 cursor-pointer"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      Add more files
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleSmartDetectStaged}
+                        disabled={isSmartAnalyzing}
+                        className="text-amber-400 hover:text-amber-300 font-medium flex items-center gap-1 cursor-pointer bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 rounded-lg transition-all disabled:opacity-50"
+                        title="Auto-detect categories & tags with quota-protection"
+                      >
+                        <Sparkles className={`w-3.5 h-3.5 ${isSmartAnalyzing ? 'animate-spin' : ''}`} />
+                        {isSmartAnalyzing ? 'Analyzing...' : 'Smart Tag All'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deviceFileInputRef.current?.click()}
+                        className="text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1 cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add more files
+                      </button>
+                    </div>
                   </div>
+
+                  {smartNotice && (
+                    <div className="p-2.5 rounded-xl bg-slate-800/80 border border-slate-700 text-xs text-slate-300 flex items-center justify-between gap-2 animate-in fade-in duration-150">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span>{smartNotice}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSmartNotice(null)}
+                        className="text-slate-400 hover:text-white p-1 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
 
                   {/* Staged files list */}
                   <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">

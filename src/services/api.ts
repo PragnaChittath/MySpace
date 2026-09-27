@@ -33,6 +33,21 @@ export interface MfaVerifyResponse {
   user: User;
 }
 
+export interface DocumentAnalysisResult {
+  success: boolean;
+  aiAvailable: boolean;
+  quotaExhausted: boolean;
+  source: 'GEMINI_AI' | 'LOCAL_HEURISTIC_ENGINE' | 'LOCAL_HEURISTIC_FALLBACK' | 'CLIENT_OFFLINE_ENGINE';
+  notice?: string;
+  category: DocumentCategory;
+  suggestedTitle: string;
+  documentNumber: string;
+  suggestedTags: string[];
+  sensitivity: SensitivityLevel;
+  reminderDaysBefore: number;
+  summary: string;
+}
+
 export interface PublicShareResponse {
   success?: boolean;
   requiresVerification?: boolean;
@@ -1469,6 +1484,81 @@ export const api = {
       encryptionStandard: 'AES-256-GCM (Zero-Knowledge)',
       zeroKnowledgeTags: true,
       scalableBacking: 'Client Encrypted IndexedDB + Serverless Vault'
+    };
+  },
+
+  // Smart Metadata Analysis (AI with Quota-Resilient Heuristic Fallback)
+  async analyzeDocumentMetadata(payload: {
+    title?: string;
+    fileName?: string;
+    fileType?: string;
+    textSnippet?: string;
+  }): Promise<DocumentAnalysisResult> {
+    if (!this.isOfflineMode()) {
+      const netRes = await safeFetch('/api/ai/analyze-document', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (netRes.ok && netRes.data && netRes.data.success) {
+        return netRes.data;
+      }
+    }
+
+    // Client-side instant heuristic analysis if offline or backend is unreachable
+    const combined = `${payload.title || ''} ${payload.fileName || ''} ${payload.textSnippet || ''}`.toLowerCase();
+    let category: DocumentCategory = 'OTHER';
+    if ((payload.fileType && payload.fileType.startsWith('audio/')) || /\.(mp3|wav|m4a|aac|ogg|flac|webm|weba)$/i.test(payload.fileName || '')) {
+      category = 'VOICE_AUDIO';
+    } else if (/(aadhaar|aadhar|pan|passport|voter|license|licence|id[-_ ]card|ssn|driving|national[-_ ]id|identity|citizen)/i.test(combined)) {
+      category = 'IDENTITY';
+    } else if (/(marksheet|degree|diploma|grade|transcript|certificate|course|resume|cv|internship|school|college|university|education)/i.test(combined)) {
+      category = 'EDUCATION';
+    } else if (/(salary|pay[-_ ]stub|payslip|tax|itr|w2|bank|statement|invoice|receipt|financial|audit|balance)/i.test(combined)) {
+      category = 'FINANCIAL';
+    } else if (/(medical|prescription|hospital|blood|vaccine|health|doctor|report|lab|diagnosis|rx|clinical)/i.test(combined)) {
+      category = 'MEDICAL';
+    } else if (/(contract|deed|agreement|affidavit|legal|court|policy|nda|patent|trademark|terms)/i.test(combined)) {
+      category = 'LEGAL';
+    } else if (/(offer[-_ ]letter|employment|appointment|relieving|experience[-_ ]letter|work[-_ ]permit|job)/i.test(combined)) {
+      category = 'EMPLOYMENT';
+    }
+
+    let documentNumber = '';
+    const panMatch = combined.match(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/i);
+    const aadhaarMatch = combined.match(/\b\d{4}\s?\d{4}\s?\d{4}\b/);
+    const passportMatch = combined.match(/\b[A-PR-WYa-pr-wy][1-9][0-9]{6}\b/);
+    if (panMatch) documentNumber = panMatch[0].toUpperCase();
+    else if (aadhaarMatch) documentNumber = aadhaarMatch[0].replace(/\s+/g, ' ');
+    else if (passportMatch) documentNumber = passportMatch[0].toUpperCase();
+
+    const tagsSet = new Set<string>();
+    tagsSet.add(category.toLowerCase().replace('_', '-'));
+    if (category === 'IDENTITY') tagsSet.add('verified-id');
+    else if (category === 'FINANCIAL') tagsSet.add('tax-record');
+    else if (category === 'MEDICAL') tagsSet.add('health-record');
+    else if (category === 'EDUCATION') tagsSet.add('qualification');
+    tagsSet.add('encrypted');
+
+    let cleanTitle = payload.title || '';
+    if (!cleanTitle && payload.fileName) {
+      cleanTitle = payload.fileName.replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
+    }
+    if (!cleanTitle) cleanTitle = `${category.charAt(0) + category.slice(1).toLowerCase()} Record`;
+
+    return {
+      success: true,
+      aiAvailable: false,
+      quotaExhausted: false,
+      source: 'CLIENT_OFFLINE_ENGINE',
+      notice: 'Client-side deterministic classification active.',
+      category,
+      documentNumber,
+      suggestedTitle: cleanTitle,
+      suggestedTags: Array.from(tagsSet),
+      sensitivity: category === 'IDENTITY' || category === 'FINANCIAL' ? 'TOP_SECRET' : 'CONFIDENTIAL',
+      reminderDaysBefore: category === 'IDENTITY' || category === 'FINANCIAL' ? 30 : 15,
+      summary: `Verified ${category.toLowerCase().replace('_', ' ')} record stored securely with client-authoritative encryption.`
     };
   },
 

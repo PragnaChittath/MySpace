@@ -7,7 +7,9 @@ import {
   Calendar,
   ShieldCheck,
   FileText,
-  AlertCircle
+  AlertCircle,
+  Sparkles,
+  Info
 } from 'lucide-react';
 import { VaultDocument, DocumentCategory, SensitivityLevel } from '../types.js';
 import { api } from '../services/api.js';
@@ -46,6 +48,8 @@ export function EditDocumentModal({
   const [expiryDate, setExpiryDate] = useState('');
   const [verifiedIssuer, setVerifiedIssuer] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisNotice, setAnalysisNotice] = useState<{ text: string; type: 'ai' | 'quota' | 'local' } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -59,11 +63,65 @@ export function EditDocumentModal({
       setIssueDate(doc.issueDate ? doc.issueDate.split('T')[0] : '');
       setExpiryDate(doc.expiryDate ? doc.expiryDate.split('T')[0] : '');
       setVerifiedIssuer(doc.verifiedIssuer || '');
+      setAnalysisNotice(null);
       setError(null);
     }
   }, [isOpen, doc]);
 
   if (!isOpen || !doc) return null;
+
+  const handleAutoSuggest = async () => {
+    setIsAnalyzing(true);
+    setAnalysisNotice(null);
+    try {
+      const res = await api.analyzeDocumentMetadata({
+        title: title || doc.title,
+        fileName: doc.fileName,
+        fileType: doc.fileType,
+        textSnippet: notes
+      });
+
+      if (res.category && res.category !== 'OTHER') {
+        setCategory(res.category);
+      }
+      if (res.documentNumber && !documentNumber) {
+        setDocumentNumber(res.documentNumber);
+      }
+      if (res.suggestedTags && res.suggestedTags.length > 0) {
+        const existing = tagsInput ? tagsInput.split(',').map(t => t.trim()).filter(Boolean) : [];
+        const merged = Array.from(new Set([...existing, ...res.suggestedTags]));
+        setTagsInput(merged.join(', '));
+      }
+      if (res.sensitivity) {
+        setSensitivity(res.sensitivity);
+      }
+
+      if (res.quotaExhausted) {
+        setAnalysisNotice({
+          text: res.notice || 'AI Studio quota limit reached. Local deterministic analysis applied seamlessly.',
+          type: 'quota'
+        });
+      } else if (res.source === 'GEMINI_AI') {
+        setAnalysisNotice({
+          text: 'AI-assisted metadata suggestions applied.',
+          type: 'ai'
+        });
+      } else {
+        setAnalysisNotice({
+          text: 'Local smart heuristic suggestions applied.',
+          type: 'local'
+        });
+      }
+    } catch {
+      // Fallback silently without breaking the user's flow
+      setAnalysisNotice({
+        text: 'Applied standard heuristic categorization.',
+        type: 'local'
+      });
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -131,6 +189,39 @@ export function EditDocumentModal({
             <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 flex items-center gap-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
+            </div>
+          )}
+
+          {/* Smart Auto-Suggest Banner / Button */}
+          <div className="flex items-center justify-between p-3 rounded-xl bg-slate-800/60 border border-slate-700/60">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-amber-400" />
+              <div>
+                <div className="text-xs font-semibold text-slate-200">Smart Vault Metadata Assistant</div>
+                <div className="text-[10px] text-slate-400">Quota-protected: works online, offline, or when AI limits are reached</div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleAutoSuggest}
+              disabled={isAnalyzing}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/30 hover:bg-blue-600/40 text-blue-300 border border-blue-500/30 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <Sparkles className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
+              {isAnalyzing ? 'Analyzing...' : 'Auto-Suggest'}
+            </button>
+          </div>
+
+          {analysisNotice && (
+            <div className={`p-2.5 rounded-xl border text-xs flex items-center gap-2 ${
+              analysisNotice.type === 'quota'
+                ? 'bg-amber-950/30 border-amber-500/30 text-amber-200'
+                : analysisNotice.type === 'ai'
+                ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200'
+                : 'bg-blue-950/30 border-blue-500/30 text-blue-200'
+            }`}>
+              <Info className="w-3.5 h-3.5 shrink-0" />
+              <span>{analysisNotice.text}</span>
             </div>
           )}
 

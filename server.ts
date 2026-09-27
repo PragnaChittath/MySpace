@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import crypto from 'crypto';
 import QRCode from 'qrcode';
+import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   User,
@@ -2891,6 +2892,185 @@ app.get('/api/crypto/benchmark', (req: Request, res: Response) => {
     authTagHex: encrypted.authTag,
     checksumSha256: encrypted.checksumSha256
   });
+});
+
+// ---------------------------------------------------------------------------
+// 16. Smart Document Metadata & Category Analyzer (Quota-Resilient)
+// ---------------------------------------------------------------------------
+function extractLocalDocumentMetadata(title: string = '', fileName: string = '', fileType: string = '', textSnippet: string = '') {
+  const combined = `${title} ${fileName} ${textSnippet}`.toLowerCase();
+
+  // 1. Detect Category
+  let category: DocumentCategory = 'OTHER';
+  if (fileType.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg|flac|webm|weba)$/i.test(fileName) || combined.includes('voice') || combined.includes('audio note')) {
+    category = 'VOICE_AUDIO';
+  } else if (/(aadhaar|aadhar|pan|passport|voter|license|licence|id[-_ ]card|ssn|driving|national[-_ ]id|identity|citizen|voter[-_ ]id)/i.test(combined)) {
+    category = 'IDENTITY';
+  } else if (/(marksheet|degree|diploma|grade|transcript|certificate|course|resume|cv|internship|school|college|university|education|academic)/i.test(combined)) {
+    category = 'EDUCATION';
+  } else if (/(salary|pay[-_ ]stub|payslip|tax|itr|w2|bank|statement|invoice|receipt|financial|audit|balance|pf|funds|pf[-_ ]statement)/i.test(combined)) {
+    category = 'FINANCIAL';
+  } else if (/(medical|prescription|hospital|blood|vaccine|health|doctor|report|lab|diagnosis|rx|clinical|patient)/i.test(combined)) {
+    category = 'MEDICAL';
+  } else if (/(contract|deed|agreement|affidavit|legal|court|policy|nda|patent|trademark|terms|attorney|notary)/i.test(combined)) {
+    category = 'LEGAL';
+  } else if (/(offer[-_ ]letter|employment|appointment|relieving|experience[-_ ]letter|work[-_ ]permit|job)/i.test(combined)) {
+    category = 'EMPLOYMENT';
+  }
+
+  // 2. Detect Document Number / Identifier Pattern
+  let documentNumber = '';
+  const panMatch = combined.match(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/i);
+  const aadhaarMatch = combined.match(/\b\d{4}\s?\d{4}\s?\d{4}\b/);
+  const passportMatch = combined.match(/\b[A-PR-WYa-pr-wy][1-9][0-9]{6}\b/);
+  const ssnMatch = combined.match(/\b\d{3}-\d{2}-\d{4}\b/);
+  const invMatch = combined.match(/\b(INV|REF|DOC|ID|REC|BILL)[-_]?[0-9A-Z]{4,12}\b/i);
+
+  if (panMatch) {
+    documentNumber = panMatch[0].toUpperCase();
+  } else if (aadhaarMatch) {
+    documentNumber = aadhaarMatch[0].replace(/\s+/g, ' ');
+  } else if (passportMatch) {
+    documentNumber = passportMatch[0].toUpperCase();
+  } else if (ssnMatch) {
+    documentNumber = ssnMatch[0];
+  } else if (invMatch) {
+    documentNumber = invMatch[0].toUpperCase();
+  }
+
+  // 3. Detect suggested tags
+  const tagsSet = new Set<string>();
+  tagsSet.add(category.toLowerCase().replace('_', '-'));
+  if (category === 'IDENTITY') {
+    tagsSet.add('verified-id');
+    tagsSet.add('government-issued');
+  } else if (category === 'FINANCIAL') {
+    tagsSet.add('tax-record');
+    tagsSet.add('financial-vault');
+  } else if (category === 'MEDICAL') {
+    tagsSet.add('health-record');
+  } else if (category === 'EDUCATION') {
+    tagsSet.add('qualification');
+  } else if (category === 'LEGAL') {
+    tagsSet.add('legal-deed');
+  } else if (category === 'VOICE_AUDIO') {
+    tagsSet.add('audio-note');
+    tagsSet.add('voice-vault');
+  }
+  tagsSet.add('encrypted');
+
+  // 4. Sensitivity
+  let sensitivity: SensitivityLevel = 'CONFIDENTIAL';
+  if (category === 'IDENTITY' || category === 'FINANCIAL') {
+    sensitivity = 'TOP_SECRET';
+  } else if (category === 'LEGAL' || category === 'MEDICAL') {
+    sensitivity = 'RESTRICTED';
+  }
+
+  // 5. Clean Title
+  let cleanTitle = title || '';
+  if (!cleanTitle && fileName) {
+    cleanTitle = fileName.replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim();
+  }
+  if (!cleanTitle) {
+    cleanTitle = `${category.charAt(0) + category.slice(1).toLowerCase()} Record`;
+  }
+
+  return {
+    category,
+    documentNumber,
+    suggestedTitle: cleanTitle,
+    suggestedTags: Array.from(tagsSet),
+    sensitivity,
+    reminderDaysBefore: category === 'IDENTITY' || category === 'FINANCIAL' ? 30 : 15,
+    summary: `Verified ${category.toLowerCase().replace('_', ' ')} record stored securely with client-authoritative encryption.`
+  };
+}
+
+app.post('/api/ai/analyze-document', async (req: Request, res: Response) => {
+  const { title, fileName, fileType, textSnippet } = req.body || {};
+
+  // 1. Prepare deterministic heuristic fallback first
+  const fallbackData = extractLocalDocumentMetadata(title, fileName, fileType, textSnippet);
+
+  // 2. Check if GEMINI_API_KEY is configured
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey.trim() === '' || apiKey === 'MY_GEMINI_API_KEY') {
+    return res.json({
+      success: true,
+      aiAvailable: false,
+      quotaExhausted: false,
+      source: 'LOCAL_HEURISTIC_ENGINE',
+      notice: 'Fast local deterministic metadata analysis applied.',
+      ...fallbackData
+    });
+  }
+
+  // 3. Attempt Gemini API with graceful quota & error protection
+  try {
+    const ai = new GoogleGenAI({});
+    const prompt = `You are a secure document vault metadata assistant. Analyze this file information:
+Filename: "${fileName || ''}"
+Title: "${title || ''}"
+MimeType: "${fileType || ''}"
+Text snippet/context: "${(textSnippet || '').substring(0, 800)}"
+
+Return a JSON object with:
+- "category": Must be one of ["IDENTITY", "EDUCATION", "EMPLOYMENT", "MEDICAL", "FINANCIAL", "LEGAL", "VOICE_AUDIO", "OTHER"]
+- "suggestedTitle": A clean, professional title for the document
+- "documentNumber": An extracted ID, number, or code (or empty string if none)
+- "suggestedTags": Array of 3-5 concise string tags
+- "sensitivity": Must be one of ["STANDARD", "RESTRICTED", "CONFIDENTIAL", "TOP_SECRET"]
+- "reminderDaysBefore": Number of days before expiry to remind (e.g. 15, 30, 45)
+- "summary": A brief 1-sentence description of the document purpose.
+
+Only output valid JSON.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json'
+      }
+    });
+
+    const responseText = response.text || '';
+    const parsed = JSON.parse(responseText);
+
+    return res.json({
+      success: true,
+      aiAvailable: true,
+      quotaExhausted: false,
+      source: 'GEMINI_AI',
+      category: parsed.category || fallbackData.category,
+      suggestedTitle: parsed.suggestedTitle || fallbackData.suggestedTitle,
+      documentNumber: parsed.documentNumber !== undefined ? String(parsed.documentNumber) : fallbackData.documentNumber,
+      suggestedTags: Array.isArray(parsed.suggestedTags) && parsed.suggestedTags.length > 0 ? parsed.suggestedTags : fallbackData.suggestedTags,
+      sensitivity: parsed.sensitivity || fallbackData.sensitivity,
+      reminderDaysBefore: parsed.reminderDaysBefore || fallbackData.reminderDaysBefore,
+      summary: parsed.summary || fallbackData.summary
+    });
+  } catch (err: any) {
+    const errMsg = err?.message || String(err);
+    const isQuotaError = errMsg.includes('429') ||
+      errMsg.includes('RESOURCE_EXHAUSTED') ||
+      errMsg.includes('quota') ||
+      errMsg.includes('rate limit') ||
+      errMsg.includes('Too Many Requests');
+
+    console.warn(`[MySpace AI Shield] Notice: ${isQuotaError ? 'Gemini API quota exhausted' : 'Gemini API unavailable'} (${errMsg}). Engaging zero-failure local heuristic engine.`);
+
+    return res.json({
+      success: true,
+      aiAvailable: false,
+      quotaExhausted: isQuotaError,
+      source: 'LOCAL_HEURISTIC_FALLBACK',
+      notice: isQuotaError
+        ? 'AI Studio / Gemini API quota limit reached. Fast local heuristic analysis applied automatically without disruption.'
+        : 'AI service currently offline. Local smart analysis applied seamlessly.',
+      ...fallbackData
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -18,9 +18,11 @@ import {
   VolumeX,
   FileAudio,
   Repeat,
-  ArrowUpRight
+  ArrowUpRight,
+  Info
 } from 'lucide-react';
 import { VaultDocument } from '../types.js';
+import { api } from '../services/api.js';
 import {
   formatBytes,
   formatDate,
@@ -55,14 +57,42 @@ export function DocumentViewerModal({
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [smartInsight, setSmartInsight] = useState<{ summary: string; notice?: string; source: string } | null>(null);
+  const [loadingInsight, setLoadingInsight] = useState(false);
 
   useEffect(() => {
     setIsPlaying(false);
     setCurrentTime(0);
+    setSmartInsight(null);
     if (doc?.audioDurationSeconds) {
       setDuration(doc.audioDurationSeconds);
     }
   }, [isOpen, doc]);
+
+  const handleFetchInsight = async () => {
+    if (!doc) return;
+    setLoadingInsight(true);
+    try {
+      const res = await api.analyzeDocumentMetadata({
+        title: doc.title,
+        fileName: doc.fileName,
+        fileType: doc.fileType,
+        textSnippet: doc.notes
+      });
+      setSmartInsight({
+        summary: res.summary,
+        notice: res.notice,
+        source: res.source
+      });
+    } catch {
+      setSmartInsight({
+        summary: `Document cataloged as ${doc.category} under ${doc.sensitivity} standard.`,
+        source: 'LOCAL_HEURISTIC_FALLBACK'
+      });
+    } finally {
+      setLoadingInsight(false);
+    }
+  };
 
   if (!isOpen || !doc) return null;
 
@@ -380,6 +410,39 @@ export function DocumentViewerModal({
                   {expBadge.label}
                 </span>
               </div>
+            </div>
+
+            {/* Smart Summary / Inspection Tool */}
+            <div className="p-3 rounded-xl bg-slate-800/60 border border-slate-700/60 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 font-semibold text-slate-300">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Document Insights</span>
+                </div>
+                {!smartInsight && (
+                  <button
+                    onClick={handleFetchInsight}
+                    disabled={loadingInsight}
+                    className="text-[11px] font-medium text-blue-400 hover:text-blue-300 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  >
+                    <Sparkles className={`w-3 h-3 ${loadingInsight ? 'animate-spin' : ''}`} />
+                    {loadingInsight ? 'Inspecting...' : 'Analyze'}
+                  </button>
+                )}
+              </div>
+              {smartInsight && (
+                <div className="space-y-1.5 animate-in fade-in duration-150">
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    {smartInsight.summary}
+                  </p>
+                  {smartInsight.notice && (
+                    <div className="text-[10px] text-amber-300/90 flex items-center gap-1 pt-1 border-t border-slate-700/40">
+                      <Info className="w-3 h-3 shrink-0" />
+                      <span>{smartInsight.notice}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Document Details List */}
